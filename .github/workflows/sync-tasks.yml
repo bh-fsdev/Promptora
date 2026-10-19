@@ -1,0 +1,30 @@
+# Creates GitHub Issues from the Task Register in docs/ai/TASKS.md. No AI and no API key involved.
+name: Sync Tasks
+
+on:
+  push:
+    branches: [main]
+    paths: ["docs/ai/TASKS.md", "scripts/sync_tasks.py"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sync-tasks
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Create missing Issues and labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/sync_tasks.py

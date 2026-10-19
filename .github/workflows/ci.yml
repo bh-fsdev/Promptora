@@ -1,0 +1,92 @@
+# CI that works before any application code exists, and expands automatically once package.json appears.
+# Runs on pull requests opened by a human (the owner). Add job names below as required status checks.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Required documents exist
+        run: |
+          for f in README.md CLAUDE.md docs/ai/PRODUCT_SPEC.md docs/ai/DECISIONS.md docs/ai/ARCHITECTURE.md docs/ai/DATABASE.md docs/ai/API_CONTRACTS.md docs/ai/TASKS.md; do
+            test -f "$f" || { echo "Missing required file: $f"; exit 1; }
+          done
+      - name: YAML files parse
+        run: |
+          python3 - <<'PY'
+          import glob, sys
+          try:
+              import yaml
+          except ImportError:
+              import subprocess; subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "pyyaml"]); import yaml
+          bad = 0
+          for p in glob.glob(".github/**/*.y*ml", recursive=True) + glob.glob("**/openapi*.y*ml", recursive=True):
+              try: yaml.safe_load(open(p))
+              except Exception as e: print("YAML error in", p, e); bad = 1
+          sys.exit(bad)
+          PY
+      - name: No oversized files
+        run: |
+          big=$(git ls-files -z | xargs -0 -I{} sh -c 'test -f "{}" && [ $(wc -c < "{}") -gt 5000000 ] && echo "{}"' || true)
+          if [ -n "$big" ]; then echo "Files over 5 MB:"; echo "$big"; exit 1; fi
+      - name: Basic secret pattern scan (changed content)
+        run: |
+          set -e
+          git diff --unified=0 origin/${{ github.base_ref }}...HEAD > /tmp/diff.txt || true
+          if grep -nE '(github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9]{30,}|gho_[A-Za-z0-9]{30,}|sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----)' /tmp/diff.txt | grep '^[0-9]*:+' ; then
+            echo "Possible secret found in the diff. Remove it and rotate it."; exit 1
+          fi
+          echo "No known secret patterns in the diff (this is a basic check, not a full scanner)."
+
+  node:
+    name: node
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Detect Node projects
+        id: detect
+        run: |
+          if find . -name package.json -not -path "*/node_modules/*" | grep -q .; then echo "found=true" >> "$GITHUB_OUTPUT"; else echo "found=false" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.found == 'true'
+        with:
+          node-version: "lts/*"
+      - name: Install, lint, typecheck, test, build (only scripts that exist)
+        if: steps.detect.outputs.found == 'true'
+        run: |
+          set -e
+          for dir in $(find . -name package.json -not -path "*/node_modules/*" -exec dirname {} \;); do
+            echo "== $dir =="
+            cd "$dir"
+            if [ -f package-lock.json ]; then npm ci; else echo "No package-lock.json in $dir: failing, lockfile is required"; exit 1; fi
+            npm run lint --if-present
+            npm run typecheck --if-present
+            npm test --if-present
+            npm run build --if-present
+            npm audit --audit-level=high || { echo "High severity advisories found"; exit 1; }
+            cd - > /dev/null
+          done
+      - name: No Node project yet
+        if: steps.detect.outputs.found != 'true'
+        run: echo "No package.json found. Node checks are skipped until application code exists."

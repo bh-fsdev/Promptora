@@ -1,0 +1,179 @@
+# DRAFT, NOT YET TESTED. Picks up READY Issues, runs a worker, verifies a branch was pushed.
+# Workers never open or merge PRs. The owner opens the PR manually, which triggers CI and review.
+# Kill switch: set repository variable WORKERS_ENABLED to "true" to allow scheduled runs.
+name: Worker Dispatch
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Optional: run this specific Issue now (must carry label worker:1 or worker:2)"
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: worker-dispatch
+  cancel-in-progress: false
+
+jobs:
+  select:
+    if: github.event_name == 'workflow_dispatch' || vars.WORKERS_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      w1: ${{ steps.pick.outputs.w1 }}
+      w2: ${{ steps.pick.outputs.w2 }}
+      w1_mode: ${{ steps.pick.outputs.w1_mode }}
+      w2_mode: ${{ steps.pick.outputs.w2_mode }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          MANUAL: ${{ inputs.issue_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          for W in 1 2; do
+            busy=$(gh issue list -R "$REPO" --state open --label "worker:$W" --label "status:in-progress" --json number --jq 'length')
+            if [ "$busy" != "0" ]; then echo "Worker $W busy, skipping"; continue; fi
+            N=""; MODE=""
+            if [ -n "${MANUAL:-}" ]; then
+              has=$(gh issue view "$MANUAL" -R "$REPO" --json labels --jq "[.labels[].name] | index(\"worker:$W\") != null")
+              if [ "$has" = "true" ]; then N="$MANUAL"; MODE="new"; fi
+            else
+              N=$(gh issue list -R "$REPO" --state open --label "worker:$W" --label "status:needs-changes" --json number --jq 'sort_by(.number)|.[0].number // empty')
+              if [ -n "$N" ]; then MODE="fix"; else
+                N=$(gh issue list -R "$REPO" --state open --label "worker:$W" --label "status:ready" --json number --jq 'sort_by(.number)|.[0].number // empty')
+                MODE="new"
+              fi
+            fi
+            [ -z "$N" ] && continue
+            TITLE=$(gh issue view "$N" -R "$REPO" --json title --jq .title)
+            TID=$(echo "$TITLE" | grep -oE 'TASK-[0-9]{3}' | head -1 || true)
+            if [ "$MODE" = "new" ] && [ -n "$TID" ]; then
+              existing=$(gh api "repos/$REPO/git/matching-refs/heads/feature/$TID-" --jq 'length')
+              if [ "$existing" != "0" ]; then
+                gh issue comment "$N" -R "$REPO" --body "Skipped automatic start: a branch for $TID already exists. Use label status:needs-changes to continue it, or remove the old branch."
+                gh issue edit "$N" -R "$REPO" --remove-label "status:ready" --add-label "status:blocked" || true
+                continue
+              fi
+            fi
+            gh issue edit "$N" -R "$REPO" --remove-label "status:ready" --remove-label "status:needs-changes" --add-label "status:in-progress" || true
+            gh issue comment "$N" -R "$REPO" --body "Claimed by Worker $W ($MODE). Run: $RUN_URL"
+            echo "w$W=$N" >> "$GITHUB_OUTPUT"
+            echo "w${W}_mode=$MODE" >> "$GITHUB_OUTPUT"
+          done
+
+  worker1:
+    needs: select
+    if: needs.select.outputs.w1 != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: read
+      id-token: write
+    env:
+      ISSUE: ${{ needs.select.outputs.w1 }}
+      MODE: ${{ needs.select.outputs.w1_mode }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          branch_prefix: "feature/"
+          prompt: |
+            You are Worker 1 (Backend Engineer). Follow docs/ai/workers/WORKER_1_BACKEND_PROMPT.md
+            and docs/ai/workers/WORKER_COMMON_RULES.md. Also read CLAUDE.md.
+            Assigned Issue: #${{ needs.select.outputs.w1 }}. Mode: ${{ needs.select.outputs.w1_mode }}.
+            Mode "new": run the pre-flight checklist; if a check fails, comment the exact blocker on the
+            Issue and stop. Otherwise create branch feature/TASK-<ID>-<short-description> from main,
+            implement only that Issue, commit, and push the branch.
+            Mode "fix": check out the existing branch feature/TASK-<ID>-*, read the Issue comments and the
+            PR review feedback (gh pr view --comments), fix the findings, commit, and push to the SAME branch.
+            Do NOT open, edit, or merge a pull request. Do not touch .github/workflows or secrets.
+            As the last step, post one Issue comment containing: a PR-ready title starting with [TASK-ID],
+            a PR body that follows .github/PULL_REQUEST_TEMPLATE.md, and the required report
+            (use NOT RUN for anything you did not execute).
+          claude_args: >-
+            --max-turns 40
+            --allowedTools "Read,Write,Edit,Glob,Grep,Bash(git:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(gh issue comment:*),Bash(gh issue view:*),Bash(gh pr view:*),Bash(gh pr diff:*)"
+      - name: Verify branch was pushed and hand off
+        if: always()
+        run: |
+          set -uo pipefail
+          TID=$(gh issue view "$ISSUE" --json title --jq .title | grep -oE 'TASK-[0-9]{3}' | head -1)
+          BR=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/feature/$TID-" --jq '.[0].ref // empty' | sed 's#refs/heads/##')
+          RUN="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ -n "$BR" ] && [ "${{ job.status }}" = "success" ]; then
+            gh issue edit "$ISSUE" --remove-label "status:in-progress" --add-label "status:review"
+            gh issue comment "$ISSUE" --body "Branch pushed: \`$BR\`. Open the PR manually: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/main...$BR?expand=1 . Use the PR title and body from the worker's comment above. Run: $RUN"
+          else
+            gh issue edit "$ISSUE" --remove-label "status:in-progress" --add-label "status:blocked"
+            gh issue comment "$ISSUE" --body "Worker run ended without a verified pushed branch (job status: ${{ job.status }}). Nothing is marked complete. Run log: $RUN"
+          fi
+
+  worker2:
+    needs: select
+    if: needs.select.outputs.w2 != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: read
+      id-token: write
+    env:
+      ISSUE: ${{ needs.select.outputs.w2 }}
+      MODE: ${{ needs.select.outputs.w2_mode }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          branch_prefix: "feature/"
+          prompt: |
+            You are Worker 2 (Frontend Engineer). Follow docs/ai/workers/WORKER_2_FRONTEND_PROMPT.md
+            and docs/ai/workers/WORKER_COMMON_RULES.md. Also read CLAUDE.md.
+            Assigned Issue: #${{ needs.select.outputs.w2 }}. Mode: ${{ needs.select.outputs.w2_mode }}.
+            Mode "new": run the pre-flight checklist; if a check fails, comment the exact blocker on the
+            Issue and stop. Otherwise create branch feature/TASK-<ID>-<short-description> from main,
+            implement only that Issue, commit, and push the branch.
+            Mode "fix": check out the existing branch feature/TASK-<ID>-*, read the Issue comments and the
+            PR review feedback (gh pr view --comments), fix the findings, commit, and push to the SAME branch.
+            Do NOT open, edit, or merge a pull request. Do not touch .github/workflows or secrets.
+            If this runner has no real browser or Lighthouse, write NOT RUN and list the commands the owner
+            must run. Never estimate measurements.
+            As the last step, post one Issue comment containing: a PR-ready title starting with [TASK-ID],
+            a PR body that follows .github/PULL_REQUEST_TEMPLATE.md, and the required report.
+          claude_args: >-
+            --max-turns 40
+            --allowedTools "Read,Write,Edit,Glob,Grep,Bash(git:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(gh issue comment:*),Bash(gh issue view:*),Bash(gh pr view:*),Bash(gh pr diff:*)"
+      - name: Verify branch was pushed and hand off
+        if: always()
+        run: |
+          set -uo pipefail
+          TID=$(gh issue view "$ISSUE" --json title --jq .title | grep -oE 'TASK-[0-9]{3}' | head -1)
+          BR=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/feature/$TID-" --jq '.[0].ref // empty' | sed 's#refs/heads/##')
+          RUN="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ -n "$BR" ] && [ "${{ job.status }}" = "success" ]; then
+            gh issue edit "$ISSUE" --remove-label "status:in-progress" --add-label "status:review"
+            gh issue comment "$ISSUE" --body "Branch pushed: \`$BR\`. Open the PR manually: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/main...$BR?expand=1 . Use the PR title and body from the worker's comment above. Run: $RUN"
+          else
+            gh issue edit "$ISSUE" --remove-label "status:in-progress" --add-label "status:blocked"
+            gh issue comment "$ISSUE" --body "Worker run ended without a verified pushed branch (job status: ${{ job.status }}). Nothing is marked complete. Run log: $RUN"
+          fi
